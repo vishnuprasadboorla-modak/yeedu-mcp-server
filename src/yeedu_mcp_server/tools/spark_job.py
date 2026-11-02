@@ -1334,7 +1334,10 @@ def _job_ident(job_id: Optional[int], job_name: Optional[str]) -> dict:
         "action must be 'enable' or 'disable'. Disabling takes the job out of "
         "active listings and stops it being run; it does not delete it and does "
         "not touch runs already in flight, and enable puts it back. Yeedu has no "
-        "job DELETE, so disable is the reversible equivalent."
+        "job DELETE, so disable is the reversible equivalent. Note that a "
+        "disabled job stops appearing in list_job_configurations entirely, so "
+        "record the job_id before disabling: re-enabling needs an id the "
+        "listing will no longer give you."
     ),
     annotations={"idempotentHint": True},
 )
