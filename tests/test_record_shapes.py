@@ -18,6 +18,7 @@ from yeedu_mcp_server.tools.access import (
     _role_rows,
 )
 from yeedu_mcp_server.tools.metastore import _linked_secret, _link_table
+from yeedu_mcp_server.tools.notebook import _widget_rows
 from yeedu_mcp_server.tools.secrets import _csv_cell, _token_table
 from yeedu_mcp_server.tools.workspace import _candidate_rows
 from yeedu_mcp_server.utils.run_metrics import _normalise
@@ -301,3 +302,96 @@ def test_normalise_survives_a_run_with_no_job_conf():
     run = _normalise({"run_id": 9})
     assert run["cluster_id"] is None and run["job_id"] is None
     assert run["status"] == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# Notebook widgets. The listing is a map keyed by widget name rather than an
+# array, and each entry repeats itself three times over: `widgetInfo`,
+# `typedWidgetInfo` and a bare `currentValue`. Reading the wrong one of those
+# gets the label and the choices from a different schema than the type, so the
+# fixtures below are the two shapes the platform documents -- a text widget and
+# a multiselect -- taken together in one map, as a real notebook returns them.
+_WIDGETS = {
+    "param_2": {
+        "currentValue": "",
+        "nuid": "cf95595f-1b73-45ee-8419-7557b0d3cd7d",
+        "typedWidgetInfo": {
+            "autoCreated": False,
+            "defaultValue": "a",
+            "label": None,
+            "name": "param_2",
+            "options": {
+                "widgetDisplayType": "Dropdown",
+                "choices": ["a", "b", "c"],
+                "fixedDomain": True,
+                "multiselect": True,
+            },
+            "parameterDataType": "String",
+        },
+        "widgetInfo": {
+            "widgetType": "multiselect",
+            "defaultValue": "a",
+            "label": None,
+            "name": "param_2",
+            "options": {
+                "widgetType": "dropdown",
+                "autoCreated": False,
+                "choices": ["a", "b", "c"],
+            },
+        },
+    },
+    "param_1": {
+        "currentValue": "status",
+        "nuid": "532a0de5-53a2-49b3-b14c-662ad1a8e5dd",
+        "typedWidgetInfo": {
+            "autoCreated": False,
+            "defaultValue": "status",
+            "label": "Enter the status of job",
+            "name": "param_1",
+            "options": {"widgetDisplayType": "Text", "validationRegex": None},
+            "parameterDataType": "String",
+        },
+        "widgetInfo": {
+            "widgetType": "text",
+            "defaultValue": "status",
+            "label": "Enter the status of job",
+            "name": "param_1",
+            "options": {
+                "widgetType": "text",
+                "autoCreated": False,
+                "validationRegex": None,
+            },
+        },
+    },
+}
+
+
+def test_widget_rows_reads_one_row_per_named_widget():
+    rows = {row[0]: row for row in _widget_rows(_WIDGETS)}
+    assert set(rows) == {"param_1", "param_2"}
+    assert "N/A" not in _cells(rows["param_1"])
+
+
+def test_widget_rows_reads_type_default_and_current_value():
+    rows = {row[0]: row for row in _widget_rows(_WIDGETS)}
+    name, kind, label, default, current, choices = rows["param_1"]
+    assert (kind, default, current) == ("text", "status", "status")
+    assert label == "Enter the status of job"
+    assert choices == ""
+
+
+def test_widget_rows_reads_the_choices_of_a_multiselect():
+    rows = {row[0]: row for row in _widget_rows(_WIDGETS)}
+    name, kind, label, default, current, choices = rows["param_2"]
+    assert kind == "multiselect"
+    assert choices == "a; b; c"
+    # A null label renders empty, not the string "None" and not "N/A": the
+    # widget genuinely has no prompt.
+    assert label == ""
+    # An unset current value is empty for the same reason.
+    assert current == ""
+
+
+def test_widget_rows_reports_no_widgets_as_no_rows():
+    assert _widget_rows({}) == []
+    assert _widget_rows(None) == []

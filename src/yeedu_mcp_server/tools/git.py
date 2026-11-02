@@ -491,3 +491,148 @@ async def git_sync(
         return f"Error git {action}: {str(e)}. HINT: Check for local modifications, conflicts, or network issues."
 
 
+
+
+# ---------------------------------------------------------------------------
+# Reading an asynchronous clone back
+#
+# git_clone_repo submits the clone and returns immediately, so its success
+# response only means the request was accepted. A clone that then fails leaves
+# an empty or half-populated GIT_FOLDER behind, and every later call against
+# that folder -- branches, status, diff -- fails for a reason that has nothing
+# to do with the call being made. These three reads are the only way to tell
+# the two apart.
+# ---------------------------------------------------------------------------
+
+_CLONE_ACTIONS = ("status", "log", "errors")
+
+
+def _clone_target(
+    workspace_id: Optional[int],
+    workspace_name: Optional[str],
+    file_id: Optional[int],
+    file_path: Optional[str],
+) -> dict:
+    """The query params that identify a Git folder, by either id or name/path."""
+    params: dict = {}
+    if workspace_id is not None:
+        params["workspace_id"] = workspace_id
+    elif workspace_name:
+        params["workspace_name"] = workspace_name
+    if file_id is not None:
+        params["file_id"] = file_id
+    elif file_path:
+        params["file_path"] = file_path
+    return params
+
+
+@mcp.tool(
+    description=(
+        "Reads back an asynchronous Git clone started by git_clone_repo. "
+        "action='status' returns job_status, created_by, start_time and end_time; "
+        "action='log' returns the clone's stdout or stderr (log_type); "
+        "action='errors' returns the workflow errors recorded against it. "
+        "git_clone_repo only submits the clone, so its response means 'accepted', "
+        "not 'finished' — this is the only way to learn whether it succeeded, and "
+        "a failed clone leaves an empty or partial folder whose later branch, "
+        "status and diff calls then fail for an unrelated-looking reason. "
+        "Identify the Git folder by file_id or file_path, inside workspace_id or "
+        "workspace_name."
+    ),
+    annotations={"readOnlyHint": True},
+)
+async def git_clone_status(
+    workspace_id: Optional[int] = Field(
+        default=None, description="Workspace ID holding the Git folder"),
+    workspace_name: Optional[str] = Field(
+        default=None, description="Workspace name, if workspace_id is not given"),
+    action: str = Field(
+        default="status", description="Action: status, log, or errors"),
+    file_id: Optional[int] = Field(
+        default=None, description="File ID of the Git folder (GIT_FOLDER type)"),
+    file_path: Optional[str] = Field(
+        default=None, description="Full path of the Git folder in the workspace"),
+    log_type: str = Field(
+        default="stdout",
+        description="Which log to read when action='log': stdout or stderr"),
+    last_n_lines: Optional[int] = Field(
+        default=None, ge=1,
+        description="Return only the last N lines when action='log'"),
+) -> str:
+    """Read the status, log or errors of a submitted Git clone."""
+    action = (action or "status").strip().lower()
+    if action not in _CLONE_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. Hint: use one of "
+            f"{', '.join(_CLONE_ACTIONS)}."
+        )
+    if workspace_id is None and not workspace_name:
+        return "Error: Either workspace_id or workspace_name is required."
+    if file_id is None and not file_path:
+        return (
+            "Error: Either file_id or file_path is required to identify the Git "
+            "folder. Hint: browse_workspace_files lists the folders in a "
+            "workspace with their file ids."
+        )
+
+    params = _clone_target(workspace_id, workspace_name, file_id, file_path)
+    target = file_path or f"file_id {file_id}"
+
+    try:
+        async with YeeduClient() as client:
+            if action == "log":
+                log = (log_type or "stdout").strip().lower()
+                if log not in ("stdout", "stderr"):
+                    return (
+                        f"Error: Invalid log_type '{log_type}'. "
+                        "Hint: use stdout or stderr."
+                    )
+                if last_n_lines is not None:
+                    params["last_n_lines"] = last_n_lines
+                raw = await client.get_raw(
+                    f"/api/v1/workspace/files/git/clone/log/{log}", params=params)
+                text = raw.decode("utf-8", errors="replace").strip() if raw else ""
+                if not text:
+                    return (
+                        f"No {log} output recorded for the clone of {target}. The "
+                        "clone may still be running — check "
+                        "git_clone_status(action='status')."
+                    )
+                return text
+
+            if action == "errors":
+                data = await client.get(
+                    "/api/v1/workspace/files/git/clone/workflow/errors",
+                    params=params)
+                rows = data.get("data") if isinstance(data, dict) else data
+                if not rows:
+                    return (
+                        f"No errors recorded against the clone of {target}. The "
+                        "query ran and returned 0 rows; this is an empty result, "
+                        "not a failed call."
+                    )
+                lines = ["error"]
+                lines += [str(r.get("error", r) if isinstance(r, dict) else r)
+                          for r in rows]
+                return "\n".join(lines)
+
+            data = await client.get(
+                "/api/v1/workspace/files/git/clone/status", params=params)
+            record = data[0] if isinstance(data, list) and data else data
+            if not isinstance(record, dict) or not record:
+                return f"No clone job found for {target}."
+            lines = ["field,value"]
+            for key in ("job_status", "created_by", "start_time", "end_time"):
+                if key in record:
+                    lines.append(f"{key},{record[key]}")
+            for key, value in record.items():
+                if key not in ("job_status", "created_by", "start_time", "end_time"):
+                    lines.append(f"{key},{value}")
+            return "\n".join(lines)
+
+    except Exception as e:
+        return (
+            f"Error reading clone {action} for {target}: {str(e)}. HINT: Confirm "
+            "the file_id or file_path points at a GIT_FOLDER created by "
+            "git_clone_repo — browse_workspace_files lists them."
+        )

@@ -20,6 +20,9 @@ from yeedu_mcp_server.utils.blast_radius import (
     notebook_run_blast_radius,
 )
 from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
+from yeedu_mcp_server.utils.export import deliver, fetch_export
+from yeedu_mcp_server.utils.listing import is_empty_listing, no_rows
+from yeedu_mcp_server.utils.params import opt
 
 
 def _ident(notebook_id: Optional[int], notebook_name: Optional[str]) -> dict:
@@ -137,7 +140,7 @@ async def get_notebook(
 
 
 @mcp.tool(
-    description="Updates a notebook configuration by notebook_id or notebook_name. Only provided fields change. Editable: notebook_name, cluster (cluster_id/cluster_name), max_concurrency, Spark conf/packages/jars/files, driver/executor resources, should_append_params. Returns the updated notebook details.",
+    description="Updates a notebook configuration by notebook_id or notebook_name. Only provided fields change. Editable: notebook_name, cluster (cluster_id/cluster_name), max_concurrency, Spark conf/packages/jars/files, driver/executor resources, should_append_params. Pass detach_cluster=True to leave the notebook attached to no cluster at all. Returns the updated notebook details.",
     annotations={"idempotentHint": True}
 )
 async def edit_notebook(
@@ -161,11 +164,34 @@ async def edit_notebook(
     total_executor_cores: Optional[int] = Field(default=None, ge=1, description="Total executor cores"),
     should_append_params: Optional[bool] = Field(
         default=None, description="Append notebook Spark configuration to the cluster-level configuration"),
+    detach_cluster: bool = Field(
+        default=False,
+        description=(
+            "Set True to detach the notebook from its cluster, leaving it unattached. "
+            "Cannot be combined with cluster_id or cluster_name; to move a notebook to "
+            "a different cluster, just pass the new one."
+        ),
+    ),
 ) -> str:
     """Edit a notebook configuration"""
     try:
         if notebook_id is None and not current_notebook_name:
             return "Error: Either notebook_id or current_notebook_name is required."
+        # `confirmed` rather than a truth test: an unset Field default arrives as
+        # a FieldInfo on a direct Python call, and a client may send the string
+        # "false" — both are truthy, and either would detach a cluster nobody
+        # asked to detach.
+        detach = confirmed(detach_cluster)
+        # Normalised because the conflict check has to hold on a direct Python
+        # call too, where an unset Field arrives as a truthy FieldInfo and would
+        # read as "a cluster was passed".
+        cluster_id, cluster_name = opt(cluster_id), opt(cluster_name)
+        if detach and (cluster_id is not None or cluster_name):
+            return (
+                "Error: detach_cluster cannot be combined with cluster_id or "
+                "cluster_name. HINT: pass detach_cluster=True alone to unattach the "
+                "notebook, or pass only the new cluster to move it."
+            )
         body = {
             "notebook_name": notebook_name, "cluster_id": cluster_id,
             "cluster_name": cluster_name, "max_concurrency": max_concurrency,
@@ -176,12 +202,21 @@ async def edit_notebook(
             "should_append_params": should_append_params,
         }
         body = {k: v for k, v in body.items() if v is not None}
+        # Detaching is the one edit whose value *is* null, so it has to be put
+        # back after the None filter strips it.
+        if detach:
+            body["cluster_id"] = None
         if not body:
             return "Error: Provide at least one field to update."
         async with YeeduClient() as client:
             data = await client.put(
                 f"/api/v1/workspace/{workspace_id}/notebook",
                 params=_ident(notebook_id, current_notebook_name), json=body)
+        if detach:
+            return (
+                "Notebook detached from its cluster. It cannot be started until a "
+                f"cluster is attached again.\n{_as_json(data)}"
+            )
         return f"Notebook updated successfully: {_as_json(data)}"
     except Exception as e:
         return f"Error editing notebook: {str(e)}. HINT: Ensure the notebook exists and cluster details are valid."
@@ -905,3 +940,396 @@ async def run_notebook_cells(
     except Exception as e:
         message = str(e).replace(token, "***") if token else str(e)
         return f"Error running notebook cells: {message}. HINT: The notebook run must be RUNNING with a started kernel."
+
+
+# ---------------------------------------------------------------------------
+# Notebook widgets
+#
+# Widgets are the notebook's input parameters: a named control with a default,
+# a current value, and for the non-text types a fixed set of choices. They live
+# in the notebook file rather than in a table, so `readWidgets` parses them out
+# of the .ipynb and an empty set answers HTTP 404 like every other listing.
+#
+# The listing is a dict keyed by widget name, not an array -- the shape is
+# Databricks' dbutils.widgets, with `currentValue` beside a `widgetInfo` and a
+# `typedWidgetInfo` that mostly repeat each other. One row per key, reading the
+# fields that differ, is the only rendering of it that stays legible.
+# ---------------------------------------------------------------------------
+
+_WIDGET_ACTIONS = (
+    "list", "get", "create", "edit", "delete", "delete_all",
+    "get_value", "set_value",
+)
+
+_WIDGET_TYPES = ("text", "dropdown", "multiselect", "combobox")
+
+#: The widget types that are a choice from a list, and so require `choices`.
+#: A text widget must not carry them at all.
+_CHOICE_TYPES = ("dropdown", "multiselect", "combobox")
+
+
+def _widget_rows(widgets: dict) -> list:
+    """Flatten the name-keyed widget map into one row per widget."""
+    rows = []
+    for name, widget in (widgets or {}).items():
+        info = widget.get("widgetInfo") or {}
+        options = info.get("options") or {}
+        choices = options.get("choices")
+        rows.append([
+            name,
+            info.get("widgetType", "N/A"),
+            info.get("label") if info.get("label") is not None else "",
+            info.get("defaultValue", "N/A"),
+            widget.get("currentValue", ""),
+            "; ".join(str(c) for c in choices) if choices else "",
+        ])
+    return rows
+
+
+@mcp.tool(
+    description=(
+        "Manages the input widgets (parameters) of a notebook, by notebook_id or "
+        "notebook_name. action='list' returns a table of every widget: "
+        "widget_name, widget_type, label, default_value, current_value, choices. "
+        "action='get' reads one widget, action='get_value' just its current "
+        "value, action='set_value' sets it. action='create' adds a widget and "
+        "needs widget_name, default_value and widget_type (text, dropdown, "
+        "multiselect or combobox); the three choice types also need choices, and "
+        "a text widget must not have any. action='edit' changes any of those "
+        "fields on an existing widget. action='delete' removes one widget and "
+        "action='delete_all' removes every widget in the notebook. Both delete "
+        "actions require confirm=True: the first call reports what it would "
+        "remove and does nothing, so ask the user before repeating the call with "
+        "confirm=True."
+    )
+)
+async def manage_notebook_widget(
+    workspace_id: int = Field(description="Workspace ID containing the notebook"),
+    action: str = Field(
+        description=(
+            "list, get, create, edit, delete, delete_all, get_value or set_value"
+        )
+    ),
+    notebook_id: Optional[int] = Field(default=None, description="Notebook ID"),
+    notebook_name: Optional[str] = Field(
+        default=None, description="Notebook name (if notebook_id not provided)"),
+    widget_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Widget name — required for every action except list and delete_all, "
+            "and the new name when creating one"
+        ),
+    ),
+    widget_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "Widget type: text, dropdown, multiselect or combobox. Required on "
+            "create."
+        ),
+    ),
+    default_value: Optional[str] = Field(
+        default=None,
+        description="The widget's default. Required on create.",
+    ),
+    label: Optional[str] = Field(
+        default=None,
+        description="Prompt shown beside the widget in the notebook UI",
+    ),
+    choices: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "The selectable options, for dropdown, multiselect and combobox "
+            "widgets only"
+        ),
+    ),
+    widget_value: Optional[str] = Field(
+        default=None,
+        description="The value to set, for action='set_value'",
+    ),
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Must be True to actually delete a widget or every widget. Leave "
+            "unset on the first call."
+        ),
+    ),
+) -> str:
+    """List, read, create, edit or delete the input widgets of a notebook."""
+    action = (action or "").strip().lower()
+    if action not in _WIDGET_ACTIONS:
+        return (
+            f"Error: unknown action '{action}'. Hint: use one of "
+            f"{', '.join(_WIDGET_ACTIONS)}."
+        )
+
+    notebook_id = opt(notebook_id)
+    notebook_name = opt(notebook_name)
+    widget_name = opt(widget_name)
+    widget_type = opt(widget_type)
+    default_value = opt(default_value)
+    label = opt(label)
+    choices = opt(choices)
+    widget_value = opt(widget_value)
+
+    if notebook_id is None and not notebook_name:
+        return (
+            "Error: Either notebook_id or notebook_name is required. Hint: "
+            "list_notebooks lists the notebooks in a workspace."
+        )
+
+    if action not in ("list", "delete_all") and not widget_name:
+        return (
+            f"Error: action='{action}' needs widget_name. Hint: "
+            "manage_notebook_widget(action='list') shows the widget names."
+        )
+
+    if action == "set_value" and widget_value is None:
+        return (
+            "Error: action='set_value' needs widget_value. Hint: pass the value "
+            "the notebook should read from this widget."
+        )
+
+    if action in ("create", "edit") and widget_type is not None:
+        if widget_type not in _WIDGET_TYPES:
+            return (
+                f"Error: unknown widget_type '{widget_type}'. Hint: valid types "
+                f"are {', '.join(_WIDGET_TYPES)}."
+            )
+        if widget_type in _CHOICE_TYPES and action == "create" and not choices:
+            return (
+                f"Error: a {widget_type} widget needs choices. Hint: pass the "
+                "options the user should pick from."
+            )
+        if widget_type == "text" and choices:
+            return (
+                "Error: a text widget cannot have choices. Hint: drop choices, "
+                "or use widget_type='dropdown' to offer a fixed set."
+            )
+
+    if action == "create":
+        missing = [
+            name for name, value in (
+                ("widget_name", widget_name),
+                ("default_value", default_value),
+                ("widget_type", widget_type),
+            ) if value is None
+        ]
+        if missing:
+            return (
+                f"Error: action='create' needs {', '.join(missing)}. Hint: "
+                f"widget_type is one of {', '.join(_WIDGET_TYPES)}."
+            )
+
+    if action == "edit" and not any(
+        v is not None for v in (widget_type, default_value, label, choices)
+    ):
+        return (
+            "Error: action='edit' needs at least one of widget_type, "
+            "default_value, label or choices to change. Hint: to change what the "
+            "notebook currently reads, use action='set_value' instead."
+        )
+
+    target = notebook_name or f"notebook_id {notebook_id}"
+    params = _ident(notebook_id, notebook_name)
+    base = f"/api/v1/workspace/{workspace_id}/notebook"
+
+    if action in ("delete", "delete_all") and not confirmed(confirm):
+        record = None
+        try:
+            async with YeeduClient() as client:
+                data = await client.get(f"{base}/widgets", params=params)
+            widgets = (data or {}).get("widgets") or {}
+            if action == "delete":
+                widgets = {k: v for k, v in widgets.items() if k == widget_name}
+            rows = _widget_rows(widgets)
+            record = serialize_table(rows, headers=[
+                "widget_name", "widget_type", "label", "default_value",
+                "current_value", "choices"]) if rows else None
+        except Exception:
+            record = None
+        return confirmation_required(
+            "Notebook widget" if action == "delete" else "All notebook widgets",
+            widget_name if action == "delete" else f"of {target}",
+            "manage_notebook_widget",
+            action=action,
+            action_label="delete" if action == "delete" else "delete every widget of",
+            record=record,
+            impact=(
+                "any notebook cell reading this widget falls back to no value, so "
+                "a run parameterised by it behaves differently"
+                if action == "delete" else
+                "every cell reading a widget in this notebook loses its input, and "
+                "the defaults and current values are not recoverable"
+            ),
+            retry=(
+                f"workspace_id={workspace_id}, "
+                + (f"notebook_id={notebook_id}" if notebook_id is not None
+                   else f"notebook_name='{notebook_name}'")
+                + (f", widget_name='{widget_name}'" if action == "delete" else "")
+            ),
+        )
+
+    try:
+        async with YeeduClient() as client:
+            if action == "list":
+                try:
+                    data = await client.get(f"{base}/widgets", params=params)
+                except Exception as exc:
+                    # A notebook with no widgets answers 404 rather than an
+                    # empty map. The path is fixed and correct, so that is the
+                    # answer "none", not a failure to look.
+                    if not is_empty_listing(exc):
+                        raise
+                    return no_rows(
+                        "widgets", {"notebook": target},
+                        hint=("HINT: add one with "
+                              "manage_notebook_widget(action='create')."),
+                    )
+                rows = _widget_rows((data or {}).get("widgets") or {})
+                if not rows:
+                    return no_rows("widgets", {"notebook": target})
+                return serialize_table(rows, headers=[
+                    "widget_name", "widget_type", "label", "default_value",
+                    "current_value", "choices"])
+
+            if action == "create":
+                body = {
+                    "name": widget_name,
+                    "default_value": default_value,
+                    "widget_type": widget_type,
+                }
+                if label is not None:
+                    body["label"] = label
+                if choices:
+                    body["choices"] = list(choices)
+                data = await client.post(
+                    f"{base}/widgets", params=params, json=body)
+                return (f"Widget '{widget_name}' created on {target}.\n"
+                        f"{_as_json(data)}")
+
+            if action == "edit":
+                body = {}
+                if widget_type is not None:
+                    body["widget_type"] = widget_type
+                if default_value is not None:
+                    body["default_value"] = default_value
+                if label is not None:
+                    body["label"] = label
+                if choices:
+                    body["choices"] = list(choices)
+                data = await client.put(
+                    f"{base}/widget",
+                    params={**params, "widget_name": widget_name}, json=body)
+                return (f"Widget '{widget_name}' updated on {target}.\n"
+                        f"{_as_json(data)}")
+
+            if action == "get":
+                data = await client.get(
+                    f"{base}/widget",
+                    params={**params, "widget_name": widget_name})
+                return _as_json(data)
+
+            if action == "get_value":
+                data = await client.get(
+                    f"{base}/widget/value",
+                    params={**params, "widget_name": widget_name})
+                return _as_json(data)
+
+            if action == "set_value":
+                data = await client.put(
+                    f"{base}/widget/value",
+                    params={**params, "widget_name": widget_name},
+                    json={"value": widget_value})
+                return (f"Widget '{widget_name}' value set on {target}.\n"
+                        f"{_as_json(data)}")
+
+            if action == "delete":
+                await client.delete(
+                    f"{base}/widget",
+                    params={**params, "widget_name": widget_name})
+                return f"Widget '{widget_name}' deleted from {target}."
+
+            await client.delete(f"{base}/widgets", params=params)
+            return f"All widgets deleted from {target}."
+
+    except Exception as e:
+        return (
+            f"Error managing widgets of {target}: {str(e)}. HINT: Confirm the "
+            "notebook exists with list_notebooks and the widget name with "
+            "manage_notebook_widget(action='list')."
+        )
+
+
+@mcp.tool(
+    description=(
+        "Exports one notebook, by notebook_id or notebook_name: its "
+        "configuration plus the .ipynb file itself. The export is a zip archive "
+        "whenever the notebook has a file, so output_path is normally required — "
+        "pass a file or a directory on the machine running this server. Set "
+        "strip_outputs=True to leave the cell outputs out of the exported "
+        ".ipynb. This is the single-notebook counterpart of export_workspace. "
+        "The export carries no secret values — secrets stay referenced by id."
+    ),
+    annotations={"readOnlyHint": True},
+)
+async def export_notebook(
+    workspace_id: int = Field(description="Workspace ID containing the notebook"),
+    notebook_id: Optional[int] = Field(
+        default=None, description="Notebook ID to export (the config, not a run_id)"),
+    notebook_name: Optional[str] = Field(
+        default=None, description="Notebook name, if notebook_id is not given"),
+    strip_outputs: Optional[bool] = Field(
+        default=None,
+        description="Leave cell outputs out of the exported .ipynb"),
+    output_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Local file or directory to write the export to, e.g. "
+            "/home/user/exports/my_notebook.zip. A directory takes the filename "
+            "the server supplies."
+        ),
+    ),
+) -> str:
+    """Export a single notebook and its file."""
+    notebook_id = opt(notebook_id)
+    notebook_name = opt(notebook_name)
+    strip_outputs = opt(strip_outputs)
+    output_path = opt(output_path)
+    subject = (f"notebook {notebook_name or notebook_id} from workspace "
+               f"{workspace_id}")
+    try:
+        if notebook_id is None and not notebook_name:
+            return (
+                "Error: Either notebook_id or notebook_name is required. Hint: "
+                "list_notebooks lists the notebooks in a workspace."
+            )
+        # The endpoint rejects both selectors together, so send exactly one.
+        params: dict = ({"notebook_id": notebook_id} if notebook_id is not None
+                        else {"notebook_name": notebook_name})
+        if strip_outputs is not None:
+            params["strip_outputs"] = str(bool(strip_outputs)).lower()
+
+        content, filename, is_text = await fetch_export(
+            f"/api/v1/workspace/{workspace_id}/notebook/export", params)
+        return deliver(
+            content, filename, is_text, output_path,
+            subject=subject,
+            fallback_name=f"{notebook_name or notebook_id}.zip",
+            inline_hint=(
+                "This notebook had no file to archive, so the export is the "
+                ".yeedu configuration document alone. Pass output_path to save "
+                "it to a file instead."
+            ),
+        )
+    except OSError as e:
+        return (
+            f"Error writing the export to {output_path}: {str(e)}. HINT: The "
+            "path is on the machine running this server; check the directory "
+            "exists and is writable."
+        )
+    except Exception as e:
+        return (
+            f"Error exporting {subject}: {str(e)}. HINT: Confirm the notebook "
+            "exists in this workspace with list_notebooks, and that notebook_id "
+            "is a notebook config id rather than a run_id."
+        )

@@ -293,6 +293,21 @@ _RESOURCES: Dict[str, Dict[str, Any]] = {
             "or writing paths under it fail"
         ),
     },
+    # Object Storage Manager. The tool lives in tools/storage.py next to the
+    # OSM file operations, but the shape of the resource belongs in this table
+    # with the others, and _crud drives all of it.
+    "object_storage_manager": {
+        "singular": "/api/v1/object_storage_manager",
+        "plural": "/api/v1/object_storage_managers",
+        "id_key": "object_storage_manager_id",
+        "name_key": "object_storage_manager_name",
+        "label": "Object storage manager",
+        "tool": "manage_storage_manager",
+        "impact": (
+            "the bucket is no longer reachable through this platform: manage_osm_files "
+            "stops working against it, and anything referencing it by id breaks"
+        ),
+    },
 }
 
 
