@@ -1565,9 +1565,10 @@ async def calculate_spark_driver_memory(
                 return str(message)
         return json.dumps(record, indent=2, default=str)
     except Exception as e:
-        # The endpoint answers an unworkable combination with HTTP 409 rather
-        # than a number, and that refusal is the answer: too little memory per
-        # driver for the concurrency asked for.
+        # The endpoint answers an unworkable combination with HTTP 400 and
+        # "The calculated Spark driver memory is below the minimum requirement
+        # of 1G for each job" rather than a number, and that refusal is the
+        # answer: too little memory per driver for the concurrency asked for.
         return (
             f"Error calculating Spark driver memory: {str(e)}. HINT: The platform "
             "rejects a combination that leaves too little memory per driver — "

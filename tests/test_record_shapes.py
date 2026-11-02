@@ -20,6 +20,7 @@ from yeedu_mcp_server.tools.access import (
 from yeedu_mcp_server.tools.metastore import _linked_secret, _link_table
 from yeedu_mcp_server.tools.notebook import _widget_rows
 from yeedu_mcp_server.tools.secrets import _csv_cell, _token_table
+from yeedu_mcp_server.tools.spark_job import _app_info_rows
 from yeedu_mcp_server.tools.workspace import _candidate_rows
 from yeedu_mcp_server.utils.run_metrics import _normalise
 
@@ -395,3 +396,91 @@ def test_widget_rows_reads_the_choices_of_a_multiselect():
 def test_widget_rows_reports_no_widgets_as_no_rows():
     assert _widget_rows({}) == []
     assert _widget_rows(None) == []
+
+
+#: `GET /workspace/{ws}/spark/job/run/workflow_job_instance_details/{app_id}`
+#: for run 1810365 of job 1801746, captured live. Note what is *not* here: the
+#: run id is under `job_id`, and there is no `run_id` key, though the spec's
+#: `WorkflowJobInstanceDetails` example shows one.
+_APP_INFO = {
+    "job_id": 1810365,
+    "application_id": "local-1793262159123",
+    "run_status": "DONE",
+    "compute_engine": 345,
+    "cluster_id": "357",
+    "workflow_job_instance_details": {
+        "workflow_job_instance_status": {
+            "workflow_job_instance_id": 1819114,
+            "workflow_job_id": 1819114,
+            "status": "DONE",
+            "previous_status": ["NONE", "INIT", "SENT", "RECEIVED", "EXECUTING"],
+            "from_date": "2026-10-29T08:22:51.553031+00:00",
+            "to_date": "infinity",
+        },
+        "workflow_execution_process": {
+            "machine_pid_number": "1580",
+            "machine_hostname": "yeedu13-c9b7944b-b5c1-33ad-6055-78cc47b1769a",
+            "machine_id": "c9b7944b-b5c1-33ad-6055-78cc47b1769a",
+            "machine_pid_user": "root",
+            "machine_node_number": "0",
+        },
+    },
+    "created_by": {"user_id": 3, "username": "sadhvik.chirunomula@modak.com"},
+    "modified_by": {"user_id": 3, "username": "sadhvik.chirunomula@modak.com"},
+    "last_update_date": "2026-10-29T08:22:35.868843+00:00",
+    "from_date": "2026-10-29T08:22:35.868843+00:00",
+    "to_date": "2026-10-29T08:22:51.553031+00:00",
+}
+
+
+def _fields(rows):
+    """field,value rows -> a dict, dropping the header."""
+    return dict(row.split(",", 1) for row in rows[1:])
+
+
+def test_app_info_reads_the_run_id_from_the_job_id_key():
+    """The whole point of the lookup: application_id in, run_id out.
+
+    The response names the field `job_id`, so reading the key as named would
+    label a run id as a job definition id, and reading `run_id` -- which the
+    spec example shows and the response omits -- would drop it entirely.
+    """
+    cells = _fields(_app_info_rows(_APP_INFO))
+    assert cells["run_id"] == "1810365"
+    assert "job_id" not in cells
+
+
+def test_app_info_reads_status_cluster_and_creator():
+    cells = _fields(_app_info_rows(_APP_INFO))
+    assert cells["application_id"] == "local-1793262159123"
+    assert cells["run_status"] == "DONE"
+    assert cells["cluster_id"] == "357"
+    assert cells["compute_engine"] == "345"
+    assert cells["created_by"] == "sadhvik.chirunomula@modak.com"
+    assert "N/A" not in "".join(_app_info_rows(_APP_INFO))
+
+
+def test_app_info_reads_the_workflow_status_history():
+    cells = _fields(_app_info_rows(_APP_INFO))
+    assert cells["workflow_status"] == "DONE"
+    assert cells["workflow_job_instance_id"] == "1819114"
+    assert cells["workflow_status_history"] == (
+        "NONE -> INIT -> SENT -> RECEIVED -> EXECUTING")
+
+
+def test_app_info_withholds_the_executing_node():
+    """The response volunteers the node's hostname, machine id, OS user and
+    pid. SYSTEM_PROMPT forbids handing back infrastructure detail, so the
+    sibling block must stay unread however convenient it looks."""
+    out = "\n".join(_app_info_rows(_APP_INFO))
+    for leak in ("yeedu13-c9b7944b", "machine_hostname", "root", "1580",
+                 "machine_id", "machine_pid"):
+        assert leak not in out
+
+
+def test_app_info_still_reads_a_run_id_key_if_one_ever_appears():
+    """The spec documents `run_id`; if the API is corrected to match, the
+    mapping must keep working rather than start returning no run id."""
+    record = {k: v for k, v in _APP_INFO.items() if k != "job_id"}
+    record["run_id"] = 1810365
+    assert _fields(_app_info_rows(record))["run_id"] == "1810365"

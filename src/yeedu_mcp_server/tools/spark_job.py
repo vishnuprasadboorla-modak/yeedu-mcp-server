@@ -1373,6 +1373,63 @@ async def set_job_state(
         )
 
 
+def _app_info_rows(record: dict) -> List[str]:
+    """Render the application-id lookup as field,value rows.
+
+    The run id arrives under the key `job_id`, and it is not a job id: the
+    projection is `'job_id', temp_cte.spark_job_instance_id`, joined from
+    `spark_job_instance.id` (`query/SparkJobInstanceStatusQuery.js`, the
+    `sqlForGetWorkflowJobInstanceDetails` SELECT and the `spark_details` CTE
+    above it). The spec's own example for `WorkflowJobInstanceDetails` calls
+    the field `run_id`; the live response does not carry that key at all.
+
+    Both plausible readings are therefore wrong, in opposite directions.
+    Reading the key as named hands back a run id labelled as a job definition
+    id -- the one substitution ID discipline exists to prevent, and the caller
+    would go on to pass it to a tool expecting a job_id. Reading `run_id`
+    instead drops the only field this lookup exists to produce, and drops it
+    silently, because an absent key renders as a missing row, not an error.
+    """
+    lines = ["field,value"]
+
+    run_id = record.get("job_id", record.get("run_id"))
+    if run_id is not None:
+        lines.append(f"run_id,{run_id}")
+
+    for key in ("application_id", "run_status", "cluster_id",
+                "compute_engine", "last_update_date", "from_date", "to_date"):
+        if key in record:
+            lines.append(f"{key},{record[key]}")
+
+    for who in ("created_by", "modified_by"):
+        value = record.get(who)
+        if isinstance(value, dict):
+            lines.append(f"{who},{value.get('username', 'N/A')}")
+        elif value is not None:
+            lines.append(f"{who},{value}")
+
+    # workflow_job_instance_details carries a sibling block,
+    # workflow_execution_process, holding the executing node's hostname,
+    # machine id, OS user and pid. That is infrastructure detail the server is
+    # not allowed to hand back, and it answers no question the caller asked, so
+    # only the status block is read.
+    details = record.get("workflow_job_instance_details")
+    status = (details or {}).get("workflow_job_instance_status") \
+        if isinstance(details, dict) else None
+    if isinstance(status, dict):
+        # The nested block names one field `workflow_job_instance_id` and the
+        # rest bare, so a blanket prefix yields `workflow_workflow_job_...`.
+        for key in ("workflow_job_instance_id", "status", "from_date", "to_date"):
+            if key in status:
+                label = key if key.startswith("workflow_") else f"workflow_{key}"
+                lines.append(f"{label},{status[key]}")
+        previous = status.get("previous_status")
+        if isinstance(previous, list) and previous:
+            lines.append(f"workflow_status_history,{' -> '.join(map(str, previous))}")
+
+    return lines
+
+
 @mcp.tool(
     description=(
         "Finds the Yeedu run that produced a given Spark application_id and "
@@ -1406,35 +1463,7 @@ async def find_run_by_application_id(
                 "per-workspace — confirm the workspace with workspace_job_runs."
             )
 
-        lines = ["field,value"]
-        for key in ("run_id", "application_id", "run_status", "cluster_id",
-                    "compute_engine", "last_update_date", "from_date", "to_date"):
-            if key in record:
-                lines.append(f"{key},{record[key]}")
-        for who in ("created_by", "modified_by"):
-            value = record.get(who)
-            if isinstance(value, dict):
-                lines.append(f"{who},{value.get('username', 'N/A')}")
-            elif value is not None:
-                lines.append(f"{who},{value}")
-
-        # workflow_job_instance_details carries a sibling block,
-        # workflow_execution_process, holding the executing node's hostname,
-        # machine id, OS user and pid. That is infrastructure detail the server
-        # is not allowed to hand back, and it answers no question the caller
-        # asked, so only the status block is read.
-        details = record.get("workflow_job_instance_details")
-        status = (details or {}).get("workflow_job_instance_status") \
-            if isinstance(details, dict) else None
-        if isinstance(status, dict):
-            for key in ("workflow_job_instance_id", "status", "from_date", "to_date"):
-                if key in status:
-                    lines.append(f"workflow_{key},{status[key]}")
-            previous = status.get("previous_status")
-            if isinstance(previous, list) and previous:
-                lines.append(f"workflow_status_history,{' -> '.join(map(str, previous))}")
-
-        return "\n".join(lines)
+        return "\n".join(_app_info_rows(record))
 
     except Exception as e:
         return (
