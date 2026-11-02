@@ -97,6 +97,22 @@ def test_role_rows_uses_the_named_role_for_a_by_role_listing():
     assert _role_rows(record, "user", fallback_role=3)[0][2] == 3
 
 
+def test_role_rows_reads_bare_role_names_from_the_tenant_wide_listing():
+    # GET /admin/roles/users aggregates `array_agg(DISTINCT role)`, so the
+    # roles are plain strings with no id, and a null array for an empty source.
+    # Skipping non-dict entries rendered every user as "—" / "—".
+    record = {
+        "user_id": 1,
+        "username": "YSU0000",
+        "user_roles": ["Platform Admin"],
+        "group_roles": ["Admin", "User"],
+    }
+    rows = _role_rows(record, "user")
+    assert [r[3] for r in rows] == [
+        "Platform Admin", "Admin (via a group)", "User (via a group)"]
+    assert all(r[0] == 1 and r[1] == "YSU0000" and r[2] == "—" for r in rows)
+
+
 def test_role_rows_accepts_the_tenant_wide_role_id_spelling():
     # The per-principal reads key a role `roles_id`; the tenant-wide ones
     # key it `role_id`.

@@ -549,16 +549,23 @@ def _role_rows(record: dict, kind: str, fallback_role: Any = None) -> list:
         if not isinstance(held, list):
             continue
         for role in held:
-            if not isinstance(role, dict):
+            bare = isinstance(role, str)
+            if bare and role.strip():
+                # The tenant-wide listing carries bare role names with no id:
+                # `array_agg(DISTINCT role)`. Not a hole in the data, so "—".
+                role_id, role_name = None, role.strip()
+            elif isinstance(role, dict):
+                role_id, role_name = _role_fields(role)
+            else:
                 continue
-            role_id, role_name = _role_fields(role)
             via = ""
             if key == "group_roles" and kind == "user":
-                group = role.get("group_name") or role.get("group_id")
+                group = None if bare else (
+                    role.get("group_name") or role.get("group_id"))
                 via = f" (via group {group})" if group else " (via a group)"
             rows.append([
                 principal_id, name,
-                role_id if role_id is not None else "N/A",
+                role_id if role_id is not None else ("—" if bare else "N/A"),
                 (role_name or "N/A") + via,
             ])
     if rows:
@@ -573,6 +580,29 @@ def _role_rows(record: dict, kind: str, fallback_role: Any = None) -> list:
         role_id if role_id is not None else "—",
         role_name or "—",
     ]]
+
+
+async def _fill_role_ids(rows: list) -> None:
+    """Resolve role ids for rows that only carry a name, in place.
+
+    The tenant-wide listings return bare role names, so the id column is "—".
+    `/api/v1/roles` maps name to id; best-effort, so a failed lookup leaves
+    the honest "—" rather than failing a listing that already worked.
+    """
+    if not any(r[2] == "—" for r in rows):
+        return
+    try:
+        async with YeeduClient() as client:
+            roles = await client.get("/api/v1/roles")
+        ids = {r["role"]: r["role_id"] for r in roles
+               if isinstance(r, dict) and r.get("role") is not None
+               and r.get("role_id") is not None}
+    except Exception:  # noqa: BLE001
+        return
+    for row in rows:
+        if row[2] == "—":
+            # Inherited rows read "Admin (via group x)"; the id is the role's.
+            row[2] = ids.get(str(row[3]).split(" (via", 1)[0], "—")
 
 
 @mcp.tool(description=(
@@ -762,6 +792,7 @@ async def manage_role_assignment(
                 f"No role assignments for {many}"
                 + (f" in tenant {tenant_id}" if tenant_id else " in your tenant") + "."
             )
+        await _fill_role_ids(rows)
         return serialize_table(rows, headers=headers) + _page_note(data, page)
 
     except Exception as e:
