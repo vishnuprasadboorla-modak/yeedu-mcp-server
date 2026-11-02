@@ -20,6 +20,7 @@ from yeedu_mcp_server.tools.access import (
 from yeedu_mcp_server.tools.metastore import _linked_secret, _link_table
 from yeedu_mcp_server.tools.notebook import _widget_rows
 from yeedu_mcp_server.tools.secrets import _csv_cell, _token_table
+from yeedu_mcp_server.tools.git import _scrub_log, _workspace_path
 from yeedu_mcp_server.tools.spark_job import _app_info_rows
 from yeedu_mcp_server.tools.workspace import _candidate_rows
 from yeedu_mcp_server.utils.run_metrics import _normalise
@@ -484,3 +485,50 @@ def test_app_info_still_reads_a_run_id_key_if_one_ever_appears():
     record = {k: v for k, v in _APP_INFO.items() if k != "job_id"}
     record["run_id"] = 1810365
     assert _fields(_app_info_rows(record))["run_id"] == "1810365"
+
+
+#: stderr of a successful clone into workspace 348, captured live. git reports
+#: progress on stderr, and names the server-side mount it is writing to.
+_CLONE_STDERR = (
+    "Cloning into '/nfs/yeedu/files/7e27253a-1ab8-4623-a789-56ae7e8939e9/348"
+    "/mcp_git_probe'...\n"
+    "Updating files:  40% (12/30)\n"
+    "Updating files: 100% (30/30), done."
+)
+
+
+def test_clone_log_keeps_what_git_actually_said():
+    """The log is the only account of a failed clone, so scrubbing must not
+    cost any of git's own output."""
+    out = _scrub_log(_CLONE_STDERR)
+    assert "Updating files: 100% (30/30), done." in out
+    assert "Cloning into" in out
+    assert "mcp_git_probe" in out
+
+
+def test_clone_log_withholds_the_mount_and_the_tenant():
+    out = _scrub_log(_CLONE_STDERR)
+    assert "/nfs/" not in out
+    assert "7e27253a-1ab8-4623-a789-56ae7e8939e9" not in out
+    assert "/yeedu/files/" not in out
+    assert "file:///files/mcp_git_probe" in out
+
+
+def test_clone_log_survives_an_empty_log():
+    assert _scrub_log("") == ""
+    assert _scrub_log(None) == ""
+
+
+def test_workspace_root_is_slash_however_it_is_written():
+    """`file:///files` is how browse_workspace_files renders the root, and the
+    backend strips that prefix before demanding an absolute path -- so the
+    root as displayed strips to the empty string and is rejected with the
+    path blank in the message."""
+    for given in ("file:///files", "/files", "/", ""):
+        assert _workspace_path(given) == "/", given
+
+
+def test_a_browsed_path_is_passed_through_as_a_workspace_path():
+    assert _workspace_path("file:///files/notebooks") == "/notebooks"
+    assert _workspace_path("/files/notebooks") == "/notebooks"
+    assert _workspace_path("/notebooks") == "/notebooks"
