@@ -293,6 +293,27 @@ _RESOURCES: Dict[str, Dict[str, Any]] = {
             "or writing paths under it fail"
         ),
     },
+    # Object Storage Manager. The tool lives in tools/storage.py next to the
+    # OSM file operations, but the shape of the resource belongs in this table
+    # with the others, and _crud drives all of it.
+    "object_storage_manager": {
+        "singular": "/api/v1/object_storage_manager",
+        "plural": "/api/v1/object_storage_managers",
+        "id_key": "object_storage_manager_id",
+        "name_key": "object_storage_manager_name",
+        # The tool shortens these two to osm_id/osm_name, to match
+        # manage_osm_files next to it. The API field names still address the
+        # endpoint, but every message _crud shows the caller has to name the
+        # parameter the caller can actually pass.
+        "param_id": "osm_id",
+        "param_name": "osm_name",
+        "label": "Object storage manager",
+        "tool": "manage_storage_manager",
+        "impact": (
+            "the bucket is no longer reachable through this platform: manage_osm_files "
+            "stops working against it, and anything referencing it by id breaks"
+        ),
+    },
 }
 
 
@@ -322,6 +343,11 @@ async def _crud(
     res = _RESOURCES[key]
     label, tool = res["label"], res["tool"]
     id_key, name_key = res["id_key"], res["name_key"]
+    # What the *caller* passes, which is the API field name unless the tool
+    # renamed it. A refusal that names a parameter the tool does not have sends
+    # the agent into a validation error instead of the confirmed call.
+    param_id = res.get("param_id", id_key)
+    param_name = res.get("param_name", name_key)
 
     selector: Dict[str, Any] = {}
     if _provided(selector_id):
@@ -332,14 +358,14 @@ async def _crud(
     if action in ("get", "edit", "delete") and not selector:
         return (
             f"Error: action='{action}' needs an identifier. "
-            f"Hint: Pass {id_key} or {name_key}; list them with "
+            f"Hint: Pass {param_id} or {param_name}; list them with "
             f"{tool}(action='list')."
         )
 
     if action == "search" and not selector_name:
         return (
             "Error: action='search' needs a name to search for. "
-            f"Hint: Pass {name_key}, or use {tool}(action='list') to see everything."
+            f"Hint: Pass {param_name}, or use {tool}(action='list') to see everything."
         )
 
     if action in ("create", "edit") and not body:
@@ -366,8 +392,8 @@ async def _crud(
             label, str(selector_id if _provided(selector_id) else selector_name), tool,
             record=record,
             impact=res.get("impact"),
-            retry=f"{id_key}={selector_id}" if _provided(selector_id)
-            else f"{name_key}='{selector_name}'",
+            retry=f"{param_id}={selector_id}" if _provided(selector_id)
+            else f"{param_name}='{selector_name}'",
         )
 
     async with YeeduClient() as client:

@@ -1525,3 +1525,54 @@ async def update_cluster(
     except Exception as e:
         return f"Error updating cluster: {str(e)}. HINT: Check if the cluster is in the correct state (DESTROYED/ERROR) to update configuration fields like labels, cloud config, spark version, storage, mounts. Fields like name, description, idle_timeout_ms can be updated in any state."
 
+
+
+@mcp.tool(
+    description=(
+        "Calculates how much Spark driver memory the platform will allocate per "
+        "job on a machine of a given size, given how many Spark jobs are allowed "
+        "to run on one instance at a time. Call this while sizing a cluster "
+        "configuration: the platform divides a node's memory across the "
+        "concurrent drivers it permits, so raising "
+        "max_parallel_spark_job_execution_per_instance shrinks every driver, and "
+        "a combination that leaves too little per driver is rejected. "
+        "machine_memory is the node's total memory in GB. Returns the platform's "
+        "own answer in words."
+    ),
+    annotations={"readOnlyHint": True},
+)
+async def calculate_spark_driver_memory(
+    machine_memory: int = Field(
+        ge=1, description="Total memory of one machine, in GB"),
+    max_parallel_spark_job_execution_per_instance: int = Field(
+        ge=1,
+        description="How many Spark jobs may run concurrently on one instance"),
+) -> str:
+    """Ask the platform what driver memory a machine shape yields per job."""
+    try:
+        async with YeeduClient() as client:
+            data = await client.get(
+                "/api/v1/cluster/spark_driver_memory",
+                params={
+                    "machine_memory": machine_memory,
+                    "max_parallel_spark_job_execution_per_instance":
+                        max_parallel_spark_job_execution_per_instance,
+                })
+        record = data[0] if isinstance(data, list) and data else data
+        if isinstance(record, dict):
+            message = record.get("message") or record.get("error_message")
+            if message:
+                return str(message)
+        return json.dumps(record, indent=2, default=str)
+    except Exception as e:
+        # The endpoint answers an unworkable combination with HTTP 400 and
+        # "The calculated Spark driver memory is below the minimum requirement
+        # of 1G for each job" rather than a number, and that refusal is the
+        # answer: too little memory per driver for the concurrency asked for.
+        return (
+            f"Error calculating Spark driver memory: {str(e)}. HINT: The platform "
+            "rejects a combination that leaves too little memory per driver — "
+            "lower max_parallel_spark_job_execution_per_instance or pick a "
+            "machine with more memory (list_compute_lookups(kind='machine_types') "
+            "has the shapes)."
+        )

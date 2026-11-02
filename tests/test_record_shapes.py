@@ -18,7 +18,10 @@ from yeedu_mcp_server.tools.access import (
     _role_rows,
 )
 from yeedu_mcp_server.tools.metastore import _linked_secret, _link_table
+from yeedu_mcp_server.tools.notebook import _widget_rows
 from yeedu_mcp_server.tools.secrets import _csv_cell, _token_table
+from yeedu_mcp_server.tools.git import _scrub_log, _workspace_path
+from yeedu_mcp_server.tools.spark_job import _app_info_rows, _function_path
 from yeedu_mcp_server.tools.workspace import _candidate_rows
 from yeedu_mcp_server.utils.run_metrics import _normalise
 
@@ -317,3 +320,270 @@ def test_normalise_survives_a_run_with_no_job_conf():
     run = _normalise({"run_id": 9})
     assert run["cluster_id"] is None and run["job_id"] is None
     assert run["status"] == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# Notebook widgets. The listing is a map keyed by widget name rather than an
+# array, and each entry repeats itself three times over: `widgetInfo`,
+# `typedWidgetInfo` and a bare `currentValue`. Reading the wrong one of those
+# gets the label and the choices from a different schema than the type, so the
+# fixtures below are the two shapes the platform documents -- a text widget and
+# a multiselect -- taken together in one map, as a real notebook returns them.
+_WIDGETS = {
+    "param_2": {
+        "currentValue": "",
+        "nuid": "cf95595f-1b73-45ee-8419-7557b0d3cd7d",
+        "typedWidgetInfo": {
+            "autoCreated": False,
+            "defaultValue": "a",
+            "label": None,
+            "name": "param_2",
+            "options": {
+                "widgetDisplayType": "Dropdown",
+                "choices": ["a", "b", "c"],
+                "fixedDomain": True,
+                "multiselect": True,
+            },
+            "parameterDataType": "String",
+        },
+        "widgetInfo": {
+            "widgetType": "multiselect",
+            "defaultValue": "a",
+            "label": None,
+            "name": "param_2",
+            "options": {
+                "widgetType": "dropdown",
+                "autoCreated": False,
+                "choices": ["a", "b", "c"],
+            },
+        },
+    },
+    "param_1": {
+        "currentValue": "status",
+        "nuid": "532a0de5-53a2-49b3-b14c-662ad1a8e5dd",
+        "typedWidgetInfo": {
+            "autoCreated": False,
+            "defaultValue": "status",
+            "label": "Enter the status of job",
+            "name": "param_1",
+            "options": {"widgetDisplayType": "Text", "validationRegex": None},
+            "parameterDataType": "String",
+        },
+        "widgetInfo": {
+            "widgetType": "text",
+            "defaultValue": "status",
+            "label": "Enter the status of job",
+            "name": "param_1",
+            "options": {
+                "widgetType": "text",
+                "autoCreated": False,
+                "validationRegex": None,
+            },
+        },
+    },
+}
+
+
+def test_widget_rows_reads_one_row_per_named_widget():
+    rows = {row[0]: row for row in _widget_rows(_WIDGETS)}
+    assert set(rows) == {"param_1", "param_2"}
+    assert "N/A" not in _cells(rows["param_1"])
+
+
+def test_widget_rows_reads_type_default_and_current_value():
+    rows = {row[0]: row for row in _widget_rows(_WIDGETS)}
+    name, kind, label, default, current, choices = rows["param_1"]
+    assert (kind, default, current) == ("text", "status", "status")
+    assert label == "Enter the status of job"
+    assert choices == ""
+
+
+def test_widget_rows_reads_the_choices_of_a_multiselect():
+    rows = {row[0]: row for row in _widget_rows(_WIDGETS)}
+    name, kind, label, default, current, choices = rows["param_2"]
+    assert kind == "multiselect"
+    assert choices == "a; b; c"
+    # A null label renders empty, not the string "None" and not "N/A": the
+    # widget genuinely has no prompt.
+    assert label == ""
+    # An unset current value is empty for the same reason.
+    assert current == ""
+
+
+def test_widget_rows_reports_no_widgets_as_no_rows():
+    assert _widget_rows({}) == []
+    assert _widget_rows(None) == []
+
+
+#: `GET /workspace/{ws}/spark/job/run/workflow_job_instance_details/{app_id}`
+#: for run 1810365 of job 1801746, captured live. Note what is *not* here: the
+#: run id is under `job_id`, and there is no `run_id` key, though the spec's
+#: `WorkflowJobInstanceDetails` example shows one.
+_APP_INFO = {
+    "job_id": 1810365,
+    "application_id": "local-1793262159123",
+    "run_status": "DONE",
+    "compute_engine": 345,
+    "cluster_id": "357",
+    "workflow_job_instance_details": {
+        "workflow_job_instance_status": {
+            "workflow_job_instance_id": 1819114,
+            "workflow_job_id": 1819114,
+            "status": "DONE",
+            "previous_status": ["NONE", "INIT", "SENT", "RECEIVED", "EXECUTING"],
+            "from_date": "2026-10-29T08:22:51.553031+00:00",
+            "to_date": "infinity",
+        },
+        "workflow_execution_process": {
+            "machine_pid_number": "1580",
+            "machine_hostname": "yeedu13-c9b7944b-b5c1-33ad-6055-78cc47b1769a",
+            "machine_id": "c9b7944b-b5c1-33ad-6055-78cc47b1769a",
+            "machine_pid_user": "root",
+            "machine_node_number": "0",
+        },
+    },
+    "created_by": {"user_id": 3, "username": "sadhvik.chirunomula@modak.com"},
+    "modified_by": {"user_id": 3, "username": "sadhvik.chirunomula@modak.com"},
+    "last_update_date": "2026-10-29T08:22:35.868843+00:00",
+    "from_date": "2026-10-29T08:22:35.868843+00:00",
+    "to_date": "2026-10-29T08:22:51.553031+00:00",
+}
+
+
+def _fields(rows):
+    """field,value rows -> a dict, dropping the header."""
+    return dict(row.split(",", 1) for row in rows[1:])
+
+
+def test_app_info_reads_the_run_id_from_the_job_id_key():
+    """The whole point of the lookup: application_id in, run_id out.
+
+    The response names the field `job_id`, so reading the key as named would
+    label a run id as a job definition id, and reading `run_id` -- which the
+    spec example shows and the response omits -- would drop it entirely.
+    """
+    cells = _fields(_app_info_rows(_APP_INFO))
+    assert cells["run_id"] == "1810365"
+    assert "job_id" not in cells
+
+
+def test_app_info_reads_status_cluster_and_creator():
+    cells = _fields(_app_info_rows(_APP_INFO))
+    assert cells["application_id"] == "local-1793262159123"
+    assert cells["run_status"] == "DONE"
+    assert cells["cluster_id"] == "357"
+    assert cells["compute_engine"] == "345"
+    assert cells["created_by"] == "sadhvik.chirunomula@modak.com"
+    assert "N/A" not in "".join(_app_info_rows(_APP_INFO))
+
+
+def test_app_info_reads_the_workflow_status_history():
+    cells = _fields(_app_info_rows(_APP_INFO))
+    assert cells["workflow_status"] == "DONE"
+    assert cells["workflow_job_instance_id"] == "1819114"
+    assert cells["workflow_status_history"] == (
+        "NONE -> INIT -> SENT -> RECEIVED -> EXECUTING")
+
+
+def test_app_info_withholds_the_executing_node():
+    """The response volunteers the node's hostname, machine id, OS user and
+    pid. SYSTEM_PROMPT forbids handing back infrastructure detail, so the
+    sibling block must stay unread however convenient it looks."""
+    out = "\n".join(_app_info_rows(_APP_INFO))
+    for leak in ("yeedu13-c9b7944b", "machine_hostname", "root", "1580",
+                 "machine_id", "machine_pid"):
+        assert leak not in out
+
+
+def test_app_info_still_reads_a_run_id_key_if_one_ever_appears():
+    """The spec documents `run_id`; if the API is corrected to match, the
+    mapping must keep working rather than start returning no run id."""
+    record = {k: v for k, v in _APP_INFO.items() if k != "job_id"}
+    record["run_id"] = 1810365
+    assert _fields(_app_info_rows(record))["run_id"] == "1810365"
+
+
+#: stderr of a successful clone into workspace 348, captured live. git reports
+#: progress on stderr, and names the server-side mount it is writing to.
+_CLONE_STDERR = (
+    "Cloning into '/nfs/yeedu/files/7e27253a-1ab8-4623-a789-56ae7e8939e9/348"
+    "/mcp_git_probe'...\n"
+    "Updating files:  40% (12/30)\n"
+    "Updating files: 100% (30/30), done."
+)
+
+
+def test_clone_log_keeps_what_git_actually_said():
+    """The log is the only account of a failed clone, so scrubbing must not
+    cost any of git's own output."""
+    out = _scrub_log(_CLONE_STDERR)
+    assert "Updating files: 100% (30/30), done." in out
+    assert "Cloning into" in out
+    assert "mcp_git_probe" in out
+
+
+def test_clone_log_withholds_the_mount_and_the_tenant():
+    out = _scrub_log(_CLONE_STDERR)
+    assert "/nfs/" not in out
+    assert "7e27253a-1ab8-4623-a789-56ae7e8939e9" not in out
+    assert "/yeedu/files/" not in out
+    assert "file:///files/mcp_git_probe" in out
+
+
+def test_clone_log_survives_an_empty_log():
+    assert _scrub_log("") == ""
+    assert _scrub_log(None) == ""
+
+
+def test_workspace_root_is_slash_however_it_is_written():
+    """`file:///files` is how browse_workspace_files renders the root, and the
+    backend strips that prefix before demanding an absolute path -- so the
+    root as displayed strips to the empty string and is rejected with the
+    path blank in the message."""
+    for given in ("file:///files", "/files", "/", ""):
+        assert _workspace_path(given) == "/", given
+
+
+def test_a_browsed_path_is_passed_through_as_a_workspace_path():
+    assert _workspace_path("file:///files/notebooks") == "/notebooks"
+    assert _workspace_path("/files/notebooks") == "/notebooks"
+    assert _workspace_path("/notebooks") == "/notebooks"
+
+
+# ---------------------------------------------------------------------------
+# A Functions job conf, as GET /workspace/{id}/spark/job returns it, trimmed
+# to what get_function_endpoint builds the HTTP path from.
+# ---------------------------------------------------------------------------
+_FUNCTION_JOB = {
+    "job_id": 1801655,
+    "job_name": "sentiment_analysis",
+    "tenant_id": "7e27253a-1ab8-4623-a789-56ae7e8939e9",
+    "yeedu_functions_function_name": "analyze",
+    "yeedu_functions_script_path": "/functions/sentiment.py",
+}
+
+
+def test_function_path_is_built_from_ids_not_names():
+    """The proxy route is /{tenant_id}/{workspace_id}/{job_id} and looks the
+    request up in Redis under f"{tenant_id}.{workspace_id}.{job_id}", keyed on
+    w.tenant_id, sj.workspace_id and sj.id. A path carrying the workspace name
+    and the job name instead -- which the proxy's own parameter names and its
+    local test harness both suggest -- gets "Job configuration not found"."""
+    path = _function_path(_FUNCTION_JOB, 298, 1801655)
+    assert path == "/7e27253a-1ab8-4623-a789-56ae7e8939e9/298/1801655"
+    assert "sentiment_analysis" not in path
+
+
+def test_function_path_falls_back_to_the_requested_job_id():
+    """A record that came back without its id still yields a usable path when
+    the caller named the job by id."""
+    record = {k: v for k, v in _FUNCTION_JOB.items() if k != "job_id"}
+    assert _function_path(record, 298, 1801655).endswith("/298/1801655")
+
+
+def test_function_path_marks_a_segment_it_could_not_resolve():
+    """Looked up by job_name on a record with neither tenant nor id, the path
+    shows placeholders rather than rendering None into a URL."""
+    path = _function_path({}, 298, None)
+    assert path == "/<tenant-id>/298/<job-id>"
+    assert "None" not in path
