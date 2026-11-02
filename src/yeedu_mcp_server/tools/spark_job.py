@@ -1541,12 +1541,6 @@ async def export_job(
         )
 
 
-#: Pages of /workspaces to scan when only the workspace id is known. The
-#: Functions URL is built from the workspace *name*, and there is no GET on
-#: /workspace to resolve one id.
-_WORKSPACE_SCAN_LIMIT = 100
-_WORKSPACE_SCAN_PAGES = 3
-
 #: The function settings worth reporting next to the endpoint: these are what
 #: a caller has to respect when they start sending requests at it.
 _FUNCTION_FIELDS = (
@@ -1560,53 +1554,54 @@ _FUNCTION_FIELDS = (
 )
 
 
-async def _workspace_name_for(client, workspace_id: int) -> Optional[str]:
-    """Resolve a workspace id to its name, best effort."""
-    for page in range(1, _WORKSPACE_SCAN_PAGES + 1):
-        data = await client.get(
-            "/api/v1/workspaces",
-            params={"pageNumber": page, "limit": _WORKSPACE_SCAN_LIMIT})
-        rows = data.get("data") if isinstance(data, dict) else data
-        rows = [r for r in (rows or []) if isinstance(r, dict)]
-        for row in rows:
-            if row.get("workspace_id") == workspace_id:
-                return row.get("name")
-        if len(rows) < _WORKSPACE_SCAN_LIMIT:
-            break
-    return None
+def _function_path(record: dict, workspace_id: int,
+                   job_id: Optional[int]) -> str:
+    """Build the proxy's POST path for a Functions job.
+
+    The route reads /{tenant_id}/{workspace_id}/{job_id}, and all three
+    segments are numeric ids despite the proxy's own parameter names: it looks
+    the request up in Redis under f"{tenant_id}.{workspace_id}.{job_id}", and
+    that hash is populated by get_all_job_configs, which keys it on
+    w.tenant_id, sj.workspace_id and sj.id (`services/
+    yeedu_functions_service.py` in Yeedu-Functions-Proxy). The abstract
+    `get_job_config(tenant_id, workspace_name, job_name)` alongside it, and the
+    local test harness that keys the same hash on names, both describe a
+    different call -- a path built from names gets "Job configuration not
+    found".
+    """
+    tenant = record.get("tenant_id") or "<tenant-id>"
+    resolved_job_id = record.get("job_id") or job_id or "<job-id>"
+    return f"/{tenant}/{workspace_id}/{resolved_job_id}"
 
 
 @mcp.tool(
     description=(
         "Reports how to call a deployed Yeedu Functions job over HTTP: the POST "
-        "path built from tenant, workspace and job name, the example request "
-        "body stored on the job, and the concurrency and timeout limits a caller "
-        "has to respect. The path is returned without a host — the Functions "
-        "proxy is a separate deployment this server does not know the address "
-        "of, so prefix it with your own proxy base URL. The function's "
+        "path built from tenant id, workspace id and job id, the example "
+        "request body stored on the job, and the concurrency and timeout limits "
+        "a caller has to respect. The path is returned without a host — the "
+        "Functions proxy is a separate deployment this server does not know the "
+        "address of, so prefix it with your own proxy base URL. The function's "
         "authorization token is NOT returned: the platform generates it and this "
         "server does not hand credentials back, so read it from the job's screen "
-        "in the UI. Identify the job by job_id or job_name; pass workspace_name "
-        "to skip looking it up."
+        "in the UI. Identify the job by job_id or job_name."
     ),
     annotations={"readOnlyHint": True},
 )
 async def get_function_endpoint(
     workspace_id: int = Field(description="Workspace ID containing the Functions job"),
     job_id: Optional[int] = Field(
-        default=None, description="Job definition ID of the YEEDU_FUNCTIONS job (not a run_id)"),
+        default=None,
+        description="Job definition ID of the Functions job (not a run_id)"),
     job_name: Optional[str] = Field(
         default=None, description="Job definition name, if job_id is not given"),
-    workspace_name: Optional[str] = Field(
-        default=None,
-        description="Workspace name, to save resolving it from workspace_id"),
 ) -> str:
     """Report the HTTP call shape of a Yeedu Functions job."""
     try:
         if job_id is None and not job_name:
             return (
                 "Error: Either job_id or job_name is required. Hint: "
-                "list_job_configurations(job_type='YEEDU_FUNCTIONS') lists the "
+                "list_job_configurations(job_type=['Functions']) lists the "
                 "Functions jobs in a workspace."
             )
 
@@ -1621,8 +1616,6 @@ async def get_function_endpoint(
                     f"workspace {workspace_id}. HINT: Confirm it with "
                     "list_job_configurations."
                 )
-            resolved_name = workspace_name or await _workspace_name_for(
-                client, workspace_id)
 
         job_type = record.get("job_type")
         if isinstance(job_type, dict):
@@ -1631,14 +1624,13 @@ async def get_function_endpoint(
 
         if job_type and str(job_type).upper() != "YEEDU_FUNCTIONS":
             return (
-                f"Error: '{name}' is a {job_type} job, not YEEDU_FUNCTIONS, so it "
-                "has no HTTP endpoint. Hint: only a Functions job is exposed over "
-                "HTTP — run a Spark job with run_job instead."
+                f"Error: '{name}' is a {display_job_type(str(job_type))} job, "
+                "not a Functions job, so it has no HTTP endpoint. Hint: only a "
+                "Functions job is exposed over HTTP — run a Spark job with "
+                "run_job instead."
             )
 
-        tenant = record.get("tenant_id") or "<tenant-id>"
-        workspace_segment = resolved_name or "<workspace-name>"
-        path = f"/{tenant}/{workspace_segment}/{name}"
+        path = _function_path(record, workspace_id, job_id)
 
         lines = [
             f"Yeedu Functions endpoint for '{name}'",
@@ -1650,14 +1642,11 @@ async def get_function_endpoint(
             "address is not something the server can report.",
             "",
             "Caller needs at least RUN permission on the workspace.",
+            "",
+            "The proxy also accepts a fourth path segment naming the endpoint "
+            f"({path}/<endpoint_name>); it defaults to the job conf name when "
+            "left off.",
         ]
-        if not resolved_name:
-            lines += [
-                "",
-                "The workspace name could not be resolved from workspace_id — the "
-                "path above has a placeholder for it. Pass workspace_name, or find "
-                "it with list_workspaces.",
-            ]
 
         settings_rows = [(k, record.get(k)) for k in _FUNCTION_FIELDS
                          if record.get(k) is not None]
@@ -1692,5 +1681,5 @@ async def get_function_endpoint(
         return (
             f"Error reading the Functions endpoint: {str(e)}. HINT: Confirm the "
             "job exists in this workspace with "
-            "list_job_configurations(job_type='YEEDU_FUNCTIONS')."
+            "list_job_configurations(job_type=['Functions'])."
         )

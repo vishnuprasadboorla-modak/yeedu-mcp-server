@@ -21,7 +21,7 @@ from yeedu_mcp_server.tools.metastore import _linked_secret, _link_table
 from yeedu_mcp_server.tools.notebook import _widget_rows
 from yeedu_mcp_server.tools.secrets import _csv_cell, _token_table
 from yeedu_mcp_server.tools.git import _scrub_log, _workspace_path
-from yeedu_mcp_server.tools.spark_job import _app_info_rows
+from yeedu_mcp_server.tools.spark_job import _app_info_rows, _function_path
 from yeedu_mcp_server.tools.workspace import _candidate_rows
 from yeedu_mcp_server.utils.run_metrics import _normalise
 
@@ -532,3 +532,42 @@ def test_a_browsed_path_is_passed_through_as_a_workspace_path():
     assert _workspace_path("file:///files/notebooks") == "/notebooks"
     assert _workspace_path("/files/notebooks") == "/notebooks"
     assert _workspace_path("/notebooks") == "/notebooks"
+
+
+# ---------------------------------------------------------------------------
+# A Functions job conf, as GET /workspace/{id}/spark/job returns it, trimmed
+# to what get_function_endpoint builds the HTTP path from.
+# ---------------------------------------------------------------------------
+_FUNCTION_JOB = {
+    "job_id": 1801655,
+    "job_name": "sentiment_analysis",
+    "tenant_id": "7e27253a-1ab8-4623-a789-56ae7e8939e9",
+    "yeedu_functions_function_name": "analyze",
+    "yeedu_functions_script_path": "/functions/sentiment.py",
+}
+
+
+def test_function_path_is_built_from_ids_not_names():
+    """The proxy route is /{tenant_id}/{workspace_id}/{job_id} and looks the
+    request up in Redis under f"{tenant_id}.{workspace_id}.{job_id}", keyed on
+    w.tenant_id, sj.workspace_id and sj.id. A path carrying the workspace name
+    and the job name instead -- which the proxy's own parameter names and its
+    local test harness both suggest -- gets "Job configuration not found"."""
+    path = _function_path(_FUNCTION_JOB, 298, 1801655)
+    assert path == "/7e27253a-1ab8-4623-a789-56ae7e8939e9/298/1801655"
+    assert "sentiment_analysis" not in path
+
+
+def test_function_path_falls_back_to_the_requested_job_id():
+    """A record that came back without its id still yields a usable path when
+    the caller named the job by id."""
+    record = {k: v for k, v in _FUNCTION_JOB.items() if k != "job_id"}
+    assert _function_path(record, 298, 1801655).endswith("/298/1801655")
+
+
+def test_function_path_marks_a_segment_it_could_not_resolve():
+    """Looked up by job_name on a record with neither tenant nor id, the path
+    shows placeholders rather than rendering None into a URL."""
+    path = _function_path({}, 298, None)
+    assert path == "/<tenant-id>/298/<job-id>"
+    assert "None" not in path
